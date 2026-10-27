@@ -1,0 +1,201 @@
+name: RDP over Tailscale
+
+# Manual trigger only – never run this on a schedule or push
+on:
+  workflow_dispatch:
+
+jobs:
+  educational-rdp:
+    runs-on: windows-latest
+    # Long timeout so the job can stay alive for learning purposes
+    # (GitHub free tier still has monthly minute limits – be mindful)
+    timeout-minutes: 3600
+
+    steps:
+      # ---------------------------------------------------------------
+      # 1. Configure Remote Desktop
+      # ---------------------------------------------------------------
+      - name: Configure RDP settings
+        shell: pwsh
+        run: |
+          Write-Host "=== Configuring Remote Desktop ==="
+
+          # Enable RDP by clearing the "deny connections" flag
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0 `
+            -Force
+
+          # WARNING: The next two settings reduce security for educational
+          # purposes only. In production you should keep:
+          #   UserAuthentication = 1  (Network Level Authentication)
+          #   SecurityLayer     = 2  (TLS)
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 0 `
+            -Force
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 0 `
+            -Force
+
+          # Remove any previous firewall rule with the same name
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+
+          # Allow inbound TCP 3389 (RDP). In a real environment you would
+          # restrict this to specific source IPs or rely solely on Tailscale.
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
+
+          # Restart the Terminal Services service so the registry changes take effect
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configuration complete."
+
+      # ---------------------------------------------------------------
+      # 2. Create a dedicated local administrator account
+      # ---------------------------------------------------------------
+      - name: Create RDP user
+        shell: pwsh
+        run: |
+          Write-Host "=== Creating local user 'RDP' ==="
+
+          # Generate a reasonably strong random password
+          $charSets = @{
+            Upper   = [char[]](65..90)          # A-Z
+            Lower   = [char[]](97..122)         # a-z
+            Number  = [char[]](48..57)          # 0-9
+            Special = [char[]](33..47) + [char[]](58..64) +
+                      [char[]](91..96) + [char[]](123..126)
+          }
+
+          $passwordChars = @()
+          $passwordChars += $charSets.Upper   | Get-Random -Count 4
+          $passwordChars += $charSets.Lower   | Get-Random -Count 4
+          $passwordChars += $charSets.Number  | Get-Random -Count 4
+          $passwordChars += $charSets.Special | Get-Random -Count 4
+
+          # Shuffle the characters
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Create the user (never expires) and add to the necessary groups
+          New-LocalUser -Name "RDP" `
+                        -Password $securePassword `
+                        -AccountNeverExpires `
+                        -FullName "Educational RDP Account"
+
+          Add-LocalGroupMember -Group "Administrators"       -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          # Expose credentials to later steps (and to the workflow summary)
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RDP_USER=RDP"           | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Quick verification
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            Write-Error "Failed to create user 'RDP'"
+            exit 1
+          }
+
+          Write-Host "User 'RDP' created successfully."
+
+      # ---------------------------------------------------------------
+      # 3. Install Tailscale
+      # ---------------------------------------------------------------
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          Write-Host "=== Installing Tailscale ==="
+
+          $msiUrl  = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $msiPath = Join-Path $env:TEMP "tailscale.msi"
+
+          Invoke-WebRequest -Uri $msiUrl -OutFile $msiPath -UseBasicParsing
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msiPath`" /quiet /norestart" `
+            -Wait
+          Remove-Item $msiPath -Force
+
+          Write-Host "Tailscale installed."
+
+      # ---------------------------------------------------------------
+      # 4. Authenticate and bring Tailscale up
+      # ---------------------------------------------------------------
+      - name: Connect to Tailscale
+        shell: pwsh
+        run: |
+          Write-Host "=== Bringing Tailscale up ==="
+
+          $tailscale = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          # Use a reusable auth key stored as a repository secret
+          & $tailscale up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname="gh-runner-$env:GITHUB_RUN_ID" `
+            --accept-routes=false
+
+          # Wait for an IPv4 address to be assigned
+          $tsIP = $null
+          for ($i = 1; $i -le 12; $i++) {
+            $tsIP = & $tailscale ip -4 2>$null
+            if ($tsIP) { break }
+            Write-Host "Waiting for Tailscale IP... ($i/12)"
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Tailscale failed to obtain an IP address"
+            exit 1
+          }
+
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale IP: $tsIP"
+
+      # ---------------------------------------------------------------
+      # 5. Basic connectivity check
+      # ---------------------------------------------------------------
+      - name: Verify RDP port is listening
+        shell: pwsh
+        run: |
+          Write-Host "=== Testing TCP connectivity to RDP port ==="
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+
+          if (-not $result.TcpTestSucceeded) {
+            Write-Error "Port 3389 is not reachable on $env:TAILSCALE_IP"
+            exit 1
+          }
+
+          Write-Host "TCP 3389 is open and reachable via Tailscale."
+
+      # ---------------------------------------------------------------
+      # 6. Keep the runner alive and print connection details
+      # ---------------------------------------------------------------
+      - name: Keep runner alive (educational session)
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host "  EDUCATIONAL RDP SESSION READY"
+          Write-Host "=============================================="
+          Write-Host "  Address  : $env:TAILSCALE_IP"
+          Write-Host "  Username : $env:RDP_USER"
+          Write-Host "  Password : $env:RDP_PASSWORD"
+          Write-Host "=============================================="
+          Write-Host ""
+          Write-Host "Connect with any RDP client to the Tailscale IP."
+          Write-Host "Cancel the workflow (or wait for the timeout) to end the session."
+          Write-Host ""
+
+          # Simple keep-alive loop
+          while ($true) {
+            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runner still active..."
+            Start-Sleep -Seconds 300
+          }
