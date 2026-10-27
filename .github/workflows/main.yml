@@ -17,22 +17,13 @@ jobs:
         run: |
           Write-Host "=== Configuring Remote Desktop ==="
 
-          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
-
-          # Disable Network Level Authentication (educational only)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
-
-          # Lower Security Layer (educational only)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
 
-          # Remove any previous firewall rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-
-          # Allow inbound TCP 3389
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
-          # Restart Terminal Services
           Restart-Service -Name TermService -Force
           Write-Host "RDP configuration complete."
 
@@ -61,7 +52,6 @@ jobs:
           $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
           New-LocalUser -Name "RDP" -Password $securePassword -AccountNeverExpires -FullName "Educational RDP Account"
-
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
@@ -102,7 +92,6 @@ jobs:
 
           $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
 
-          # Check if Tailscale executable exists
           if (-not (Test-Path $tailscaleExe)) {
             Write-Error "Tailscale executable not found at $tailscaleExe"
             exit 1
@@ -110,13 +99,12 @@ jobs:
 
           Write-Host "Found Tailscale at: $tailscaleExe"
 
-          # Bring Tailscale up
-          & \( tailscaleExe up --authkey= \){{ secrets.TAILSCALE_AUTH_KEY }} --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-routes=false
+          # Correct call
+          & "\( tailscaleExe" up --authkey= \){{ secrets.TAILSCALE_AUTH_KEY }} --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-routes=false
 
-          # Wait for an IPv4 address
           $tsIP = $null
           for ($i = 1; $i -le 15; $i++) {
-            $tsIP = & $tailscaleExe ip -4 2>$null
+            $tsIP = & "$tailscaleExe" ip -4 2>$null
             if ($tsIP) { break }
             Write-Host "Waiting for Tailscale IP... ($i/15)"
             Start-Sleep -Seconds 4
@@ -124,7 +112,7 @@ jobs:
 
           if (-not $tsIP) {
             Write-Error "Tailscale failed to obtain an IP address"
-            & $tailscaleExe status
+            & "$tailscaleExe" status
             exit 1
           }
 
@@ -135,38 +123,4 @@ jobs:
       # 5. Basic connectivity check
       # ---------------------------------------------------------------
       - name: Verify RDP port is listening
-        shell: pwsh
-        run: |
-          Write-Host "=== Testing TCP connectivity to RDP port ==="
-          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
-
-          if (-not $result.TcpTestSucceeded) {
-            Write-Error "Port 3389 is not reachable on $env:TAILSCALE_IP"
-            exit 1
-          }
-
-          Write-Host "TCP 3389 is open and reachable via Tailscale."
-
-      # ---------------------------------------------------------------
-      # 6. Keep the runner alive and print connection details
-      # ---------------------------------------------------------------
-      - name: Keep runner alive (educational session)
-        shell: pwsh
-        run: |
-          Write-Host ""
-          Write-Host "=============================================="
-          Write-Host "  EDUCATIONAL RDP SESSION READY"
-          Write-Host "=============================================="
-          Write-Host "  Address  : $env:TAILSCALE_IP"
-          Write-Host "  Username : $env:RDP_USER"
-          Write-Host "  Password : $env:RDP_PASSWORD"
-          Write-Host "=============================================="
-          Write-Host ""
-          Write-Host "Connect with any RDP client to the Tailscale IP."
-          Write-Host "Cancel the workflow (or wait for the timeout) to end the session."
-          Write-Host ""
-
-          while ($true) {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Runner still active..."
-            Start-Sleep -Seconds 300
-          }
+        shell:
