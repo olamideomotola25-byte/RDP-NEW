@@ -64,25 +64,29 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "=== Bringing Tailscale up ==="
-          $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tailscaleExe)) {
-            Write-Error "Tailscale executable not found at $tailscaleExe"
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Error "Tailscale not found at $exe"
             exit 1
           }
-          Write-Host "Found Tailscale at: $tailscaleExe"
-          & "\( tailscaleExe" up --authkey= \){{ secrets.TAILSCALE_AUTH_KEY }} --hostname="gh-runner-$env:GITHUB_RUN_ID" --accept-routes=false
+          Write-Host "Found Tailscale at: $exe"
+
+          Start-Process -FilePath \( exe -ArgumentList "up","--authkey= \){{ secrets.TAILSCALE_AUTH_KEY }}","--hostname=gh-runner-$env:GITHUB_RUN_ID","--accept-routes=false" -Wait -NoNewWindow
+
           $tsIP = $null
           for ($i = 1; $i -le 15; $i++) {
-            $tsIP = & "$tailscaleExe" ip -4 2>$null
+            $tsIP = & $exe ip -4 2>$null
             if ($tsIP) { break }
             Write-Host "Waiting for Tailscale IP... ($i/15)"
             Start-Sleep -Seconds 4
           }
+
           if (-not $tsIP) {
-            Write-Error "Tailscale failed to obtain an IP address"
-            & "$tailscaleExe" status
+            Write-Error "Tailscale failed to get an IP"
+            & $exe status
             exit 1
           }
+
           "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Tailscale IP: $tsIP"
 
